@@ -1,0 +1,13 @@
+# Overlay for values/minio-a.yaml and values/minio-b.yaml -- the "before" state.
+#
+# It drops the two blocks that exist only to support STS: the bucket-scoped
+# policy, and the MinIO user whose identity Polaris assumes. What is left is a
+# plain MinIO with a bucket and its root credentials, which is what an
+# STS-unavailable deployment looks like.
+#
+# Helm replaces lists wholesale, so an empty list here removes the entries
+# defined in the base values file. Step 9 of the README stops passing this overlay, and the
+# chart's post-upgrade job then creates the user and policy on the running
+# instance.
+users: []
+policies: []

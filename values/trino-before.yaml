@@ -1,0 +1,84 @@
+# Trino as it looks BEFORE the migration: one Iceberg catalog, pointed at
+# minio-a, using static S3 keys.
+#
+# This is a short values file rather than an overlay on values/trino.yaml,
+# because Helm cannot delete the lakehouse_fast catalog key contributed by that
+# file -- it renders as an empty catalog and the chart fails. Everything not set
+# here keeps the chart's default. Step 13 of the README switches the release over to the
+# repo's values/trino.yaml, which adds lakehouse_fast.
+image:
+  tag: "476"
+  pullPolicy: IfNotPresent
+
+server:
+  workers: 1
+
+# Credentials arrive as environment variables; the catalog files below reference
+# them with ${ENV:...}. In the before state ACCESS_KEY_MINIO holds minio-a's
+# ROOT credentials -- there is no scoped user yet. Step 9 repoints the same two
+# variables at cat-a-user.
+envFrom:
+  - secretRef:
+      name: trino-secrets
+
+catalogs:
+  tpch: |
+    connector.name=tpch
+    tpch.splits-per-node=4
+  tpcds: |
+    connector.name=tpcds
+    tpcds.splits-per-node=4
+  lakehouse: |
+    connector.name=iceberg
+    iceberg.catalog.type=rest
+    iceberg.rest-catalog.uri=http://polaris:8181/api/catalog
+    iceberg.rest-catalog.warehouse=lakehouse
+    iceberg.rest-catalog.vended-credentials-enabled=false
+    iceberg.rest-catalog.security=OAUTH2
+    iceberg.rest-catalog.oauth2.credential=${ENV:POLARIS_AUTH}
+    iceberg.rest-catalog.oauth2.scope=PRINCIPAL_ROLE:ALL
+    iceberg.rest-catalog.oauth2.server-uri=http://polaris:8181/api/catalog/v1/oauth/tokens
+    iceberg.expire-snapshots.min-retention=1h
+    iceberg.remove-orphan-files.min-retention=1h
+    iceberg.add-files-procedure.enabled=true
+    fs.native-s3.enabled=true
+    s3.endpoint=http://minio-a:9000
+    s3.path-style-access=true
+    s3.aws-access-key=${ENV:ACCESS_KEY_MINIO}
+    s3.aws-secret-key=${ENV:SECRET_KEY_MINIO}
+    s3.region=us-east-1
+
+# Sized for a single-node minikube, exactly as values/trino.yaml does it.
+coordinator:
+  jvm:
+    maxHeapSize: "1400M"
+    gcMethod:
+      type: "UseG1GC"
+      g1:
+        heapRegionSize: "32M"
+  config:
+    query:
+      maxMemoryPerNode: "768MB"
+  resources:
+    requests:
+      cpu: 300m
+      memory: 1Gi
+    limits:
+      memory: 2Gi
+
+worker:
+  jvm:
+    maxHeapSize: "1400M"
+    gcMethod:
+      type: "UseG1GC"
+      g1:
+        heapRegionSize: "32M"
+  config:
+    query:
+      maxMemoryPerNode: "768MB"
+  resources:
+    requests:
+      cpu: 300m
+      memory: 1Gi
+    limits:
+      memory: 2Gi

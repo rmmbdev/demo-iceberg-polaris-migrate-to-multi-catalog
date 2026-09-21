@@ -1,0 +1,32 @@
+# Overlay for values/polaris.yaml -- the "before" state.
+#
+# Two differences from the target state, both about where Polaris gets the
+# credentials it uses for its own Iceberg metadata reads and writes:
+#
+#   * credential resolution by storage name is off, so Polaris never looks for a
+#     per-catalog credential pair;
+#   * extraEnv carries no polaris.storage.aws.<storageName>.* pair. Instead it
+#     carries AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY -- minio-a's ROOT user.
+#
+# That last part is the whole shape of a deployment without STS. With
+# "stsUnavailable": true on the catalog Polaris never calls AssumeRole, so it
+# never builds credentials from the storage configuration at all; the S3 client
+# it uses for metadata falls back to the AWS default credentials provider chain,
+# and the environment variables below are what that chain finds. Leave them out
+# and every CREATE TABLE fails with
+#
+#   SdkClientException: Unable to load credentials from any of the providers in
+#   the chain AwsCredentialsProviderChain(...)
+#
+features:
+  RESOLVE_CREDENTIALS_BY_STORAGE_NAME: false
+
+extraEnv:
+  - name: AWS_REGION
+    value: "us-east-1"
+  - name: AWS_ACCESS_KEY_ID
+    valueFrom:
+      secretKeyRef: { name: minio-a-secrets, key: rootUser }
+  - name: AWS_SECRET_ACCESS_KEY
+    valueFrom:
+      secretKeyRef: { name: minio-a-secrets, key: rootPassword }

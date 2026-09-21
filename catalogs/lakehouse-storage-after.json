@@ -1,0 +1,13 @@
+{
+  "storageType": "S3",
+  "storageName": "storagea",
+  "roleArn": "arn:aws:iam::000000000000:role/minio-ignored",
+  "region": "us-east-1",
+  "allowedLocations": ["s3://neshan-lakehouse/"],
+  "endpoint": "http://minio-a:9000",
+  "endpointInternal": "http://minio-a:9000",
+  "stsEndpoint": "http://minio-a:9000",
+  "pathStyleAccess": true,
+  "stsUnavailable": false,
+  "kmsUnavailable": true
+}

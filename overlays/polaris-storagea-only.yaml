@@ -1,0 +1,36 @@
+# Overlay for values/polaris.yaml -- the intermediate state reached in step 10
+# of the README.
+#
+# Credential resolution by storage name is now on, and the server knows the
+# credentials for storage name "storagea" only. That is deliberate: a catalog
+# may not name a storage the server has no credentials for. Polaris raises
+#
+#   IllegalArgumentException: Storage name 'storageb' is not configured on the server
+#
+# the moment it has to vend credentials for such a catalog, so "storageb" is
+# added in step 13, together with the catalog that uses it.
+#
+# The ambient AWS_* pair from the before state is still here, and has to be:
+# until the catalog is patched in step 11 it still says
+# "stsUnavailable": true, so Polaris is still reaching MinIO through the default
+# credentials provider chain. Step 13 drops this overlay for the repo's
+# values/polaris.yaml, which has no AWS_ACCESS_KEY_ID at all -- and nothing
+# misses it, because by then every catalog gets its credentials from AssumeRole.
+features:
+  RESOLVE_CREDENTIALS_BY_STORAGE_NAME: true
+
+extraEnv:
+  - name: AWS_REGION
+    value: "us-east-1"
+  - name: AWS_ACCESS_KEY_ID
+    valueFrom:
+      secretKeyRef: { name: minio-a-secrets, key: rootUser }
+  - name: AWS_SECRET_ACCESS_KEY
+    valueFrom:
+      secretKeyRef: { name: minio-a-secrets, key: rootPassword }
+  - name: polaris.storage.aws.storagea.access-key
+    valueFrom:
+      secretKeyRef: { name: catalog-users-secrets, key: catAUser }
+  - name: polaris.storage.aws.storagea.secret-key
+    valueFrom:
+      secretKeyRef: { name: catalog-users-secrets, key: catAPassword }

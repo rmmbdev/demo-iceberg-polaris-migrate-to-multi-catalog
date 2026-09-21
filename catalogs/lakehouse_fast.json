@@ -1,0 +1,19 @@
+{
+  "catalog": {
+    "name": "lakehouse_fast",
+    "type": "INTERNAL",
+    "properties": { "default-base-location": "s3://neshan-lakehouse-fast/" },
+    "storageConfigInfo": {
+      "storageType": "S3",
+      "storageName": "storageb",
+      "roleArn": "arn:aws:iam::000000000000:role/minio-ignored",
+      "region": "us-east-1",
+      "allowedLocations": ["s3://neshan-lakehouse-fast/"],
+      "endpoint": "http://minio-b:9000",
+      "endpointInternal": "http://minio-b:9000",
+      "stsEndpoint": "http://minio-b:9000",
+      "pathStyleAccess": true,
+      "kmsUnavailable": true
+    }
+  }
+}

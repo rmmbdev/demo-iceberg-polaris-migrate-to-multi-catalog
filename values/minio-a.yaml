@@ -1,0 +1,52 @@
+# MinIO instance A -- official MinIO chart (https://charts.min.io/).
+# Serves bucket neshan-lakehouse. Root credentials come from the
+# minio-a-secrets Secret, whose keys must be named rootUser / rootPassword.
+mode: standalone
+replicas: 1
+
+image:
+  tag: RELEASE.2025-01-20T14-49-07Z
+  pullPolicy: IfNotPresent
+mcImage:
+  tag: RELEASE.2025-01-17T23-25-50Z
+  pullPolicy: IfNotPresent
+
+existingSecret: minio-a-secrets
+
+# Both releases would otherwise create a ServiceAccount named "minio-sa",
+# and the second install would fail on the name collision.
+serviceAccount:
+  create: true
+  name: "minio-a-sa"
+
+persistence:
+  enabled: true
+  size: 2Gi
+
+resources:
+  requests:
+    memory: 512Mi
+
+# Declarative bucket creation -- replaces the hand-written mkbucket Job.
+buckets:
+  - name: neshan-lakehouse
+    policy: none
+    purge: false
+
+# Bucket-scoped policy. AssumeRole-issued temporary credentials INHERIT this
+# policy, so each catalog's vended credentials reach only its own bucket.
+policies:
+  - name: bucket-a-rw
+    statements:
+      - resources:
+          - 'arn:aws:s3:::neshan-lakehouse'
+          - 'arn:aws:s3:::neshan-lakehouse/*'
+        actions:
+          - "s3:*"
+
+# The identity Polaris uses to call AssumeRole for this catalog.
+users:
+  - accessKey: cat-a-user
+    existingSecret: catalog-users-secrets
+    existingSecretKey: catAPassword
+    policy: bucket-a-rw

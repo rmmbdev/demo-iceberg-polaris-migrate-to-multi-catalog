@@ -1,0 +1,53 @@
+# MinIO instance B -- official MinIO chart (https://charts.min.io/).
+# Serves bucket neshan-lakehouse-fast.
+#
+# The `users` block below creates this instance's own user, scoped to its own
+# bucket. Polaris assumes that user via STS for the lakehouse_fast catalog.
+mode: standalone
+replicas: 1
+
+image:
+  tag: RELEASE.2025-01-20T14-49-07Z
+  pullPolicy: IfNotPresent
+mcImage:
+  tag: RELEASE.2025-01-17T23-25-50Z
+  pullPolicy: IfNotPresent
+
+existingSecret: minio-b-secrets
+
+# Both releases would otherwise create a ServiceAccount named "minio-sa",
+# and the second install would fail on the name collision.
+serviceAccount:
+  create: true
+  name: "minio-b-sa"
+
+persistence:
+  enabled: true
+  size: 2Gi
+
+resources:
+  requests:
+    memory: 512Mi
+
+buckets:
+  - name: neshan-lakehouse-fast
+    policy: none
+    purge: false
+
+# Bucket-scoped policy. AssumeRole-issued temporary credentials INHERIT this
+# policy, so each catalog's vended credentials reach only its own bucket.
+policies:
+  - name: bucket-b-rw
+    statements:
+      - resources:
+          - 'arn:aws:s3:::neshan-lakehouse-fast'
+          - 'arn:aws:s3:::neshan-lakehouse-fast/*'
+        actions:
+          - "s3:*"
+
+# The identity Polaris uses to call AssumeRole for this catalog.
+users:
+  - accessKey: cat-b-user
+    existingSecret: catalog-users-secrets
+    existingSecretKey: catBPassword
+    policy: bucket-b-rw

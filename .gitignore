@@ -1,0 +1,7 @@
+.idea/
+.venv/
+tmp/
+logs/
+*.log
+out/
+backup/
