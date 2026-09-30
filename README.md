@@ -16,27 +16,28 @@ and `values/trino.yaml` describe. No table is rewritten and no object is moved.
 | what Polaris sends MinIO | long-lived root keys | `AssumeRole` credentials, ~1 hour, confined to one bucket |
 | Trino S3 credentials | `minio-a`'s **root** user | `cat-a-user` / `cat-b-user`, each scoped to its bucket |
 
-**Run every command from the directory holding this file.** Every path below —
-`secrets/`, `values/`, `catalogs/`, `manifests/`, `overlays/` — is relative to
-it. Start with:
+**Run every command from the directory holding this file, in one terminal.**
+Every path below — `secrets/`, `values/`, `catalogs/`, `manifests/`,
+`overlays/` — is relative to it. Start with:
 
 ```bash
   cd /home/reza/projects/git/demo-iceberg-polaris-migrate-to-multi-catalog
 ```
 
-Run the steps in order. `$TOKEN`, `$POLARIS_AUTH`, `$TRINO_TOKEN` and `$VERSION`
-are the only values that are not fixed — the commands below capture them.
-`$TOKEN` and `$TRINO_TOKEN` expire after an hour; re-run the `export` that
-produced them if a call starts answering `401`, and read `$VERSION` immediately
-before the `PUT` that consumes it. `$POLARIS_AUTH` is the one that cannot be
-re-captured: the command that produces it is the command that creates the
-principal — see
-[If you lose the POLARIS_AUTH pair](#if-you-lose-the-polaris_auth-pair).
+Run the steps in order, and the blocks inside each step top to bottom. Each step
+is self-contained: it takes nothing from your shell that it did not set itself.
+Every step that talks to Polaris opens with the same block, which restarts the
+port-forward in the background and issues a fresh `$TOKEN`. Every step that
+needs Trino's Polaris credentials reads them back out of the `trino-secrets`
+Secret, which is the one place they are kept. A new terminal, an expired token
+or a replaced Polaris pod therefore never breaks a step.
 
-This repository is self-contained: everything the steps below reference is in
-it. Steps 1 and 2 are the same cluster setup the companion project uses; steps 3
-onwards replace its from-scratch build, which is reproduced at the end of this
-file for comparison. Do not run both on one cluster.
+Blocks that check something print a line starting `OK:` or `STOP:`. On `STOP:`,
+do not go on to the next block. Blocks that change something refuse to run on a
+bad value, so a `STOP:` never leaves anything half-written.
+
+The from-scratch build of the companion project is reproduced at the end of
+this file for comparison. Do not run both on one cluster.
 
 ## 1. Helm repositories
 
@@ -60,12 +61,23 @@ file for comparison. Do not run both on one cluster.
 
 ```bash
   docker pull postgres:17.2-bookworm && \
-  docker pull quay.io/minio/minio:RELEASE.2025-01-20T14-49-07Z && \
-  docker pull quay.io/minio/mc:RELEASE.2025-01-17T23-25-50Z && \
+  docker pull docker.arvancloud.ir/minio/minio:RELEASE.2025-01-20T14-49-07Z && \
+  docker tag  docker.arvancloud.ir/minio/minio:RELEASE.2025-01-20T14-49-07Z quay.io/minio/minio:RELEASE.2025-01-20T14-49-07Z && \
+  docker pull docker.arvancloud.ir/minio/mc:RELEASE.2025-01-17T23-25-50Z && \
+  docker tag  docker.arvancloud.ir/minio/mc:RELEASE.2025-01-17T23-25-50Z quay.io/minio/mc:RELEASE.2025-01-17T23-25-50Z && \
   docker pull apache/polaris:1.5.0 && \
   docker pull apache/polaris-admin-tool:1.5.0 && \
   docker pull trinodb/trino:476
 ```
+
+The two MinIO images come from the `docker.arvancloud.ir` mirror of Docker Hub,
+because an anonymous pull from `quay.io` stops at a `Login prior to pull:`
+prompt and, inside this `&&` chain, waits there indefinitely instead of failing.
+Each is re-tagged with its `quay.io` name: the MinIO chart runs
+`quay.io/minio/minio` and `quay.io/minio/mc`, and with `pullPolicy:
+IfNotPresent` it only finds an image loaded into minikube under that exact name.
+If `docker.arvancloud.ir` is unavailable, `hub.hamdocker.ir` serves the same two
+tags with the same digests.
 
 ```bash
   minikube start --memory=8192 --cpus=4 && \
@@ -129,20 +141,32 @@ second instance.
   kubectl rollout status deploy/polaris --timeout=600s
 ```
 
-This one blocks. Leave it running and open a second terminal for the rest.
+Connect to Polaris. This stops anything listening on local port 8181, starts
+the port-forward in the background — there is no second terminal — and checks
+that `root` can log in:
 
 ```bash
-  kubectl port-forward svc/polaris 8181:8181
+  lsof -t -i tcp:8181 -s tcp:LISTEN | xargs -r kill ; sleep 1 ; \
+  (kubectl port-forward svc/polaris 8181:8181 > /dev/null 2>&1 &) ; \
+  for i in $(seq 60); do curl -s -o /dev/null http://localhost:8181/api/catalog/v1/config && break; sleep 1; done ; \
+  TOKEN=$(curl -s -X POST http://localhost:8181/api/catalog/v1/oauth/tokens \
+    -d "grant_type=client_credentials&client_id=root&client_secret=root&scope=PRINCIPAL_ROLE:ALL" \
+    | jq -r '.access_token // empty') ; export TOKEN ; \
+  if [ -n "$TOKEN" ]; then echo 'OK: Polaris is reachable and TOKEN is set'; else echo 'STOP: no TOKEN -- Polaris is not answering on localhost:8181'; fi
 ```
 
 ## 6. The catalog, the principal, and Trino
 
-In the second terminal:
+Connect to Polaris:
 
 ```bash
-  export TOKEN=$(curl -s -X POST http://localhost:8181/api/catalog/v1/oauth/tokens \
+  lsof -t -i tcp:8181 -s tcp:LISTEN | xargs -r kill ; sleep 1 ; \
+  (kubectl port-forward svc/polaris 8181:8181 > /dev/null 2>&1 &) ; \
+  for i in $(seq 60); do curl -s -o /dev/null http://localhost:8181/api/catalog/v1/config && break; sleep 1; done ; \
+  TOKEN=$(curl -s -X POST http://localhost:8181/api/catalog/v1/oauth/tokens \
     -d "grant_type=client_credentials&client_id=root&client_secret=root&scope=PRINCIPAL_ROLE:ALL" \
-    | jq -r '.access_token')
+    | jq -r '.access_token // empty') ; export TOKEN ; \
+  if [ -n "$TOKEN" ]; then echo 'OK: Polaris is reachable and TOKEN is set'; else echo 'STOP: no TOKEN -- Polaris is not answering on localhost:8181'; fi
 ```
 
 ```bash
@@ -157,11 +181,28 @@ In the second terminal:
     -d '{"type": "catalog", "privilege": "CATALOG_MANAGE_CONTENT"}'
 ```
 
+Create Trino's principal and store its credentials in `trino-secrets` in the
+same block. Polaris returns a principal's secret exactly once, in the response
+to this call, and keeps only a hash — the Secret is the only copy there will
+ever be. The block writes the Secret only if Polaris actually returned a
+`clientId` and `clientSecret`; any error (a `401`, or a `409` because
+`trino-svc` already exists) writes nothing and prints `STOP:`.
+
+`ACCESS_KEY_MINIO` is `minio-a`'s **root** user here; `cat-a-user` does not exist yet.
+
 ```bash
-  export POLARIS_AUTH=$(curl -s -X POST http://localhost:8181/api/management/v1/principals \
+  POLARIS_AUTH=$(curl -s -X POST http://localhost:8181/api/management/v1/principals \
     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
     -d '{"principal": {"name": "trino-svc", "type": "SERVICE"}}' \
-    | jq -r '.credentials.clientId + ":" + .credentials.clientSecret')
+    | jq -r 'if .credentials.clientId and .credentials.clientSecret then .credentials.clientId + ":" + .credentials.clientSecret else empty end') ; \
+  export POLARIS_AUTH ; \
+  if [ -n "$POLARIS_AUTH" ]; then \
+    kubectl create secret generic trino-secrets \
+      --from-literal=POLARIS_AUTH="$POLARIS_AUTH" \
+      --from-literal=ACCESS_KEY_MINIO='lakehouse-key' \
+      --from-literal=SECRET_KEY_MINIO='lakehouse-secret-0123456789' \
+    && echo 'OK: trino-svc created and its pair stored in trino-secrets' ; \
+  else echo 'STOP: Polaris returned no credentials for trino-svc -- nothing was written'; fi
 ```
 
 ```bash
@@ -182,13 +223,14 @@ In the second terminal:
     -d '{"principalRole": {"name": "data_engineer"}}'
 ```
 
-`ACCESS_KEY_MINIO` is `minio-a`'s **root** user here; `cat-a-user` does not exist yet.
+The pair in the Secret must log in to Polaris:
 
 ```bash
-  kubectl create secret generic trino-secrets \
-    --from-literal=POLARIS_AUTH="$POLARIS_AUTH" \
-    --from-literal=ACCESS_KEY_MINIO='lakehouse-key' \
-    --from-literal=SECRET_KEY_MINIO='lakehouse-secret-0123456789'
+  POLARIS_AUTH=$(kubectl get secret trino-secrets -o jsonpath='{.data.POLARIS_AUTH}' | base64 -d) ; export POLARIS_AUTH ; \
+  TRINO_TOKEN=$(curl -s -X POST http://localhost:8181/api/catalog/v1/oauth/tokens \
+    -d "grant_type=client_credentials&client_id=${POLARIS_AUTH%%:*}&client_secret=${POLARIS_AUTH##*:}&scope=PRINCIPAL_ROLE:ALL" \
+    | jq -r '.access_token // empty') ; export TRINO_TOKEN ; \
+  if [ -n "$TRINO_TOKEN" ]; then echo 'OK: the trino-svc pair in trino-secrets authenticates'; else echo 'STOP: the POLARIS_AUTH pair in trino-secrets does not authenticate'; fi
 ```
 
 ```bash
@@ -203,6 +245,18 @@ In the second terminal:
 ```
 
 ## 7. Confirm the starting point
+
+Connect to Polaris:
+
+```bash
+  lsof -t -i tcp:8181 -s tcp:LISTEN | xargs -r kill ; sleep 1 ; \
+  (kubectl port-forward svc/polaris 8181:8181 > /dev/null 2>&1 &) ; \
+  for i in $(seq 60); do curl -s -o /dev/null http://localhost:8181/api/catalog/v1/config && break; sleep 1; done ; \
+  TOKEN=$(curl -s -X POST http://localhost:8181/api/catalog/v1/oauth/tokens \
+    -d "grant_type=client_credentials&client_id=root&client_secret=root&scope=PRINCIPAL_ROLE:ALL" \
+    | jq -r '.access_token // empty') ; export TOKEN ; \
+  if [ -n "$TOKEN" ]; then echo 'OK: Polaris is reachable and TOKEN is set'; else echo 'STOP: no TOKEN -- Polaris is not answering on localhost:8181'; fi
+```
 
 No `storageName`, no `stsEndpoint`:
 
@@ -236,20 +290,37 @@ SELECT * FROM lakehouse.bronze.customers;
 ```
 
 Ask Polaris for that table as an Iceberg client would. This is the sharpest
-check after the migration, so it is worth seeing what it answers now:
+check after the migration, so it is worth seeing what it answers now. First
+log in as Trino, with the pair from `trino-secrets`:
 
 ```bash
-  export TRINO_TOKEN=$(curl -s -X POST http://localhost:8181/api/catalog/v1/oauth/tokens \
+  POLARIS_AUTH=$(kubectl get secret trino-secrets -o jsonpath='{.data.POLARIS_AUTH}' | base64 -d) ; export POLARIS_AUTH ; \
+  TRINO_TOKEN=$(curl -s -X POST http://localhost:8181/api/catalog/v1/oauth/tokens \
     -d "grant_type=client_credentials&client_id=${POLARIS_AUTH%%:*}&client_secret=${POLARIS_AUTH##*:}&scope=PRINCIPAL_ROLE:ALL" \
-    | jq -r '.access_token')
+    | jq -r '.access_token // empty') ; export TRINO_TOKEN ; \
+  if [ -n "$TRINO_TOKEN" ]; then echo 'OK: the trino-svc pair in trino-secrets authenticates'; else echo 'STOP: the POLARIS_AUTH pair in trino-secrets does not authenticate'; fi
 ```
 
 ```bash
   curl -s http://localhost:8181/api/catalog/v1/lakehouse/namespaces/bronze/tables/customers \
     -H "Authorization: Bearer $TRINO_TOKEN" \
     -H "X-Iceberg-Access-Delegation: vended-credentials" \
-    | jq -r '.config["s3.session-token"] // "no session token -- Polaris is not calling AssumeRole"'
+    | jq -rn '(try input catch null) as $r
+       | if $r.metadata != null then $r.config["s3.session-token"] // "table returned, but no session token"
+         elif ($r.error.message // "" | test("no credentials are available")) then "Polaris refuses to vend credentials -- it is not calling AssumeRole"
+         else "request failed: \($r.error.message // "empty response -- check $TRINO_TOKEN and the port-forward")" end'
 ```
+
+The answer you want here is `Polaris refuses to vend credentials`. With
+`"stsUnavailable": true` Polaris does not return the table without credentials:
+it rejects the request outright with `400 IllegalArgumentException: Credential
+vending was requested for table bronze.customers, but no credentials are
+available`. That rejection is the proof: it is Polaris itself saying it has
+nothing to vend. The same request *without* the `X-Iceberg-Access-Delegation`
+header answers `200`, which is why Trino, which does not send it, is unaffected.
+
+Anything starting with `request failed:` is some other error — a `401`, a `404`,
+a missing grant — and has told you nothing. Do not read it as a pass.
 
 ## 8. Add the second MinIO
 
@@ -280,6 +351,12 @@ Write, read, delete — from inside the cluster, where `minio-b` resolves:
       echo '--- clean up ---'; mc rm b/neshan-lakehouse-fast/probe.txt"
 ```
 
+The last line answers `Created delete marker`, not a plain removal. That does
+not mean the probe survives. Versioning on both buckets is *suspended* (`mc
+version info` says so), so the delete replaces the object's `null` version with
+a `null`-version delete marker: the 18 bytes are gone, and what remains is a
+0-byte marker that `mc ls --versions` shows as `null v1 DEL probe.txt`.
+
 ## 9. Scoped users on both MinIO instances
 
 Dropping the overlay is what creates them. The chart does it from a
@@ -287,8 +364,7 @@ Dropping the overlay is what creates them. The chart does it from a
 policy also enter the chart's ConfigMap, which changes the Deployment's
 `checksum/config` annotation and so replaces the MinIO pod. Each of the two
 upgrades below restarts its instance; at `replicas: 1` that is an
-object-storage outage, not merely a job run. See [Before you run this in
-production](#before-you-run-this-in-production).
+object-storage outage of about two seconds, not merely a job run.
 
 ```bash
   kubectl create secret generic catalog-users-secrets --from-env-file=secrets/catalog-users-secrets.env
@@ -311,7 +387,16 @@ production](#before-you-run-this-in-production).
 ```
 
 `AssumeRole` credentials inherit the user's policy, so proving it on the user
-proves it for every session Polaris mints. The last write must fail:
+proves it for every session Polaris mints. The last write must fail.
+
+Read the failure for what it is. `neshan-lakehouse-fast` does not exist on
+`minio-a`, so the check proves the policy confines `cat-a-user` to its own
+bucket on its own instance: the answer is `Insufficient permissions`, not a
+missing-bucket error, because MinIO evaluates the policy first. It says nothing
+about `minio-b`, where `cat-a-user` does not exist at all. Isolation between the
+two instances comes from their being separate identity stores, not from any
+policy. The probe's `mc rm` leaves a `null`-version delete marker in
+`neshan-lakehouse`, as versioning is suspended; the object itself is gone.
 
 ```bash
   kubectl exec deploy/minio-a -- sh -c "
@@ -324,29 +409,13 @@ proves it for every session Polaris mints. The last write must fail:
       echo ok | mc pipe scoped/neshan-lakehouse-fast/probe.txt || echo 'denied, as it should be'"
 ```
 
-Move Trino's own S3 keys off root. Check `$POLARIS_AUTH` first — if this shell
-has lost it, the command below still succeeds and writes a broken credential, and
-nothing fails until the query at the end of this step answers `Not authorized:`
-with an empty message. The check tests the pair's *shape*, not merely its length,
-because the string `":"` is neither empty nor a credential, and is exactly what a
-re-run of step 6 leaves behind. If it fires, do not improvise — go to
-[If you lose the POLARIS_AUTH pair](#if-you-lose-the-polaris_auth-pair).
+Move Trino's own S3 keys off root. `kubectl patch` changes only the two keys it
+names; `POLARIS_AUTH` is not in the command, so it stays exactly as it is:
 
 ```bash
-  case "$POLARIS_AUTH" in ?*:?*) ;; *) echo 'POLARIS_AUTH is not a clientId:clientSecret pair -- do not run the next command';; esac
+  kubectl patch secret trino-secrets --type merge \
+    -p '{"stringData": {"ACCESS_KEY_MINIO": "cat-a-user", "SECRET_KEY_MINIO": "cat-a-secret-0123456789"}}'
 ```
-
-```bash
-  kubectl create secret generic trino-secrets \
-    --from-literal=POLARIS_AUTH="$POLARIS_AUTH" \
-    --from-literal=ACCESS_KEY_MINIO='cat-a-user' \
-    --from-literal=SECRET_KEY_MINIO='cat-a-secret-0123456789' \
-    --dry-run=client -o yaml | kubectl apply -f -
-```
-
-`kubectl apply` warns that the Secret is missing `last-applied-configuration`,
-because step 6 created it imperatively. It patches the annotation itself; the
-Secret is updated and the warning is expected.
 
 ```bash
   kubectl rollout restart deploy/trino-coordinator deploy/trino-worker && \
@@ -363,7 +432,7 @@ Secret is updated and the warning is expected.
 
 `overlays/polaris-storagea-only.yaml` turns `RESOLVE_CREDENTIALS_BY_STORAGE_NAME`
 on and adds the `storagea` pair. It keeps the `AWS_*` root keys, which the
-catalog still needs until step 11.
+catalog still needs until it is patched.
 
 ```bash
   helm upgrade --install polaris polaris/polaris --version 1.5.0 \
@@ -376,17 +445,16 @@ catalog still needs until step 11.
   kubectl rollout status deploy/polaris --timeout=600s
 ```
 
-The pod was replaced, which killed the port-forward. Restart it in the second
-terminal, then re-export the token:
+The pod was replaced, which killed the port-forward. Connect to Polaris again:
 
 ```bash
-  kubectl port-forward svc/polaris 8181:8181
-```
-
-```bash
-  export TOKEN=$(curl -s -X POST http://localhost:8181/api/catalog/v1/oauth/tokens \
+  lsof -t -i tcp:8181 -s tcp:LISTEN | xargs -r kill ; sleep 1 ; \
+  (kubectl port-forward svc/polaris 8181:8181 > /dev/null 2>&1 &) ; \
+  for i in $(seq 60); do curl -s -o /dev/null http://localhost:8181/api/catalog/v1/config && break; sleep 1; done ; \
+  TOKEN=$(curl -s -X POST http://localhost:8181/api/catalog/v1/oauth/tokens \
     -d "grant_type=client_credentials&client_id=root&client_secret=root&scope=PRINCIPAL_ROLE:ALL" \
-    | jq -r '.access_token')
+    | jq -r '.access_token // empty') ; export TOKEN ; \
+  if [ -n "$TOKEN" ]; then echo 'OK: Polaris is reachable and TOKEN is set'; else echo 'STOP: no TOKEN -- Polaris is not answering on localhost:8181'; fi
 ```
 
 ```bash
@@ -403,28 +471,64 @@ Nothing observable has changed — the catalog still says `"stsUnavailable": tru
 
 ## 11. Patch the catalog
 
-**Take a backup first — see [Backup and restore](#backup-and-restore).** It costs
-one `pg_dump` and no downtime, and it is the only thing that covers a mistake
-the rollback `PUT` cannot reach.
-
-This is the migration. `currentEntityVersion` is an optimistic lock, so read it
-immediately before writing.
+This is the migration. Connect to Polaris first:
 
 ```bash
-  export VERSION=$(curl -s http://localhost:8181/api/management/v1/catalogs/lakehouse \
-    -H "Authorization: Bearer $TOKEN" | jq -r '.entityVersion')
+  lsof -t -i tcp:8181 -s tcp:LISTEN | xargs -r kill ; sleep 1 ; \
+  (kubectl port-forward svc/polaris 8181:8181 > /dev/null 2>&1 &) ; \
+  for i in $(seq 60); do curl -s -o /dev/null http://localhost:8181/api/catalog/v1/config && break; sleep 1; done ; \
+  TOKEN=$(curl -s -X POST http://localhost:8181/api/catalog/v1/oauth/tokens \
+    -d "grant_type=client_credentials&client_id=root&client_secret=root&scope=PRINCIPAL_ROLE:ALL" \
+    | jq -r '.access_token // empty') ; export TOKEN ; \
+  if [ -n "$TOKEN" ]; then echo 'OK: Polaris is reachable and TOKEN is set'; else echo 'STOP: no TOKEN -- Polaris is not answering on localhost:8181'; fi
+```
+
+Back up the metastore. It costs one `pg_dump` and no downtime, and it is the
+only thing that covers a mistake the patch cannot undo by itself. `pg_dump` is
+transactionally consistent, so it runs with everything live. The dump contains
+every principal's credentials; `backup/` is in `.gitignore` — keep it that way,
+and treat the file as a secret. Each backup gets its own timestamped directory,
+created with a plain `mkdir` that refuses an existing name, so a backup never
+overwrites an earlier one. The block checks that the dump holds Polaris's tables
+(a dump against the wrong database succeeds and is empty) and that both JSON
+records came back from the API:
+
+```bash
+  BACKUP=backup/$(date +%Y%m%dT%H%M%S) ; export BACKUP ; \
+  mkdir -p backup && mkdir "$BACKUP" && \
+  kubectl exec deploy/postgres-polaris -- \
+    pg_dump -U postgres -d polaris --format=plain --clean --if-exists \
+    > "$BACKUP/polaris-metastore.sql" && \
+  [ "$(grep -c 'COPY polaris_schema' "$BACKUP/polaris-metastore.sql")" -gt 0 ] && \
+  curl -sf http://localhost:8181/api/management/v1/catalogs \
+    -H "Authorization: Bearer $TOKEN" > "$BACKUP/catalogs.json" && \
+  curl -sf http://localhost:8181/api/management/v1/principal-roles \
+    -H "Authorization: Bearer $TOKEN" > "$BACKUP/principal-roles.json" && \
+  echo "OK: backup complete in $BACKUP" || echo "STOP: the backup in $BACKUP is incomplete -- do not patch the catalog"
 ```
 
 ```bash
-  curl -X PUT http://localhost:8181/api/management/v1/catalogs/lakehouse \
-    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-    -d "$(jq -n --argjson version "$VERSION" \
-          --slurpfile storage catalogs/lakehouse-storage-after.json \
-          '{currentEntityVersion: $version, storageConfigInfo: $storage[0]}')"
+  jq -r '.catalogs[] | "\(.name) entityVersion=\(.entityVersion) storageName=\(.storageConfigInfo.storageName)"' "$BACKUP/catalogs.json"
 ```
 
-The net change is three fields, and `properties` is left out of the request so
-`default-base-location` is untouched:
+Patch. `currentEntityVersion` is an optimistic lock, so the block reads it and
+sends the `PUT` in one go. It sends nothing unless the backup above exists in
+this shell and the version was read successfully:
+
+```bash
+  VERSION=$(curl -sf http://localhost:8181/api/management/v1/catalogs/lakehouse \
+    -H "Authorization: Bearer $TOKEN" | jq -r '.entityVersion // empty') ; export VERSION ; \
+  if [ -s "$BACKUP/polaris-metastore.sql" ] && [ -s "$BACKUP/catalogs.json" ] && [ -n "$VERSION" ]; then \
+    curl -s -w '\nHTTP %{http_code}\n' -X PUT http://localhost:8181/api/management/v1/catalogs/lakehouse \
+      -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+      -d "$(jq -n --argjson version "$VERSION" \
+            --slurpfile storage catalogs/lakehouse-storage-after.json \
+            '{currentEntityVersion: $version, storageConfigInfo: $storage[0]}')" ; \
+  else echo 'STOP: no backup in this shell, or the entityVersion of lakehouse could not be read -- nothing was sent. Run the two blocks above again.'; fi
+```
+
+It must end with `HTTP 200`. The net change is three fields, and `properties` is
+left out of the request so `default-base-location` is untouched:
 
 ```diff
 + "storageName": "storagea",
@@ -440,29 +544,51 @@ The net change is three fields, and `properties` is left out of the request so
 
 `"matches catalogs/lakehouse.json"` means the live catalog satisfies every
 field of `catalogs/lakehouse.json` — the definition the from-scratch build
-creates it with. Any other output is the list of fields that differ. Empty
-output means the request itself failed, not that the check passed:
+creates it with. A list is the fields that differ. `request failed: ...` means
+Polaris never returned the catalog, so nothing was compared:
 
 ```bash
   curl -s http://localhost:8181/api/management/v1/catalogs/lakehouse \
     -H "Authorization: Bearer $TOKEN" \
-    | jq --slurpfile target catalogs/lakehouse.json \
-      '.storageConfigInfo as $live
-       | $target[0].catalog.storageConfigInfo
-       | to_entries | map(select(.value != $live[.key]))
-       | if length == 0 then "matches catalogs/lakehouse.json" else . end'
+    | jq -n --slurpfile target catalogs/lakehouse.json \
+      '(try input catch null) as $r
+       | if $r.storageConfigInfo == null then "request failed: \($r.error.message // "empty response -- check $TOKEN and the port-forward")"
+         else $r.storageConfigInfo as $live
+           | $target[0].catalog.storageConfigInfo
+           | to_entries | map(select(.value != $live[.key]))
+           | if length == 0 then "matches catalogs/lakehouse.json" else . end end'
 ```
+
+Keep the failure branch. Without it an error still produces output: a `404`
+has no `storageConfigInfo`, so every field of the target looks different, and
+the result is a list of all ten keys that reads as a patch gone badly wrong
+rather than a request that never landed.
 
 ## 12. Verify the migration
 
-The request that answered "no session token" in step 7 now returns one, and its
-`parent` claim names the MinIO user Polaris assumed:
+Connect to Polaris, and log in as Trino with the pair from `trino-secrets`:
 
 ```bash
-  export TRINO_TOKEN=$(curl -s -X POST http://localhost:8181/api/catalog/v1/oauth/tokens \
-    -d "grant_type=client_credentials&client_id=${POLARIS_AUTH%%:*}&client_secret=${POLARIS_AUTH##*:}&scope=PRINCIPAL_ROLE:ALL" \
-    | jq -r '.access_token')
+  lsof -t -i tcp:8181 -s tcp:LISTEN | xargs -r kill ; sleep 1 ; \
+  (kubectl port-forward svc/polaris 8181:8181 > /dev/null 2>&1 &) ; \
+  for i in $(seq 60); do curl -s -o /dev/null http://localhost:8181/api/catalog/v1/config && break; sleep 1; done ; \
+  TOKEN=$(curl -s -X POST http://localhost:8181/api/catalog/v1/oauth/tokens \
+    -d "grant_type=client_credentials&client_id=root&client_secret=root&scope=PRINCIPAL_ROLE:ALL" \
+    | jq -r '.access_token // empty') ; export TOKEN ; \
+  if [ -n "$TOKEN" ]; then echo 'OK: Polaris is reachable and TOKEN is set'; else echo 'STOP: no TOKEN -- Polaris is not answering on localhost:8181'; fi
 ```
+
+```bash
+  POLARIS_AUTH=$(kubectl get secret trino-secrets -o jsonpath='{.data.POLARIS_AUTH}' | base64 -d) ; export POLARIS_AUTH ; \
+  TRINO_TOKEN=$(curl -s -X POST http://localhost:8181/api/catalog/v1/oauth/tokens \
+    -d "grant_type=client_credentials&client_id=${POLARIS_AUTH%%:*}&client_secret=${POLARIS_AUTH##*:}&scope=PRINCIPAL_ROLE:ALL" \
+    | jq -r '.access_token // empty') ; export TRINO_TOKEN ; \
+  if [ -n "$TRINO_TOKEN" ]; then echo 'OK: the trino-svc pair in trino-secrets authenticates'; else echo 'STOP: the POLARIS_AUTH pair in trino-secrets does not authenticate'; fi
+```
+
+Before the patch, Polaris refused this request with `400`. Now it succeeds and
+carries a session token, and the token's `parent` claim names the MinIO user
+Polaris assumed:
 
 ```bash
   curl -s http://localhost:8181/api/catalog/v1/lakehouse/namespaces/bronze/tables/customers \
@@ -507,10 +633,12 @@ files written with root keys and the later ones under STS:
   09:18  customers-ca4f229f.../metadata/00004-....metadata.json   <- after it
 ```
 
-Five files, not two: the `CREATE TABLE` and `INSERT` in step 7 wrote `00000`
-through `00002`, and the `INSERT` in step 12 wrote `00003` and `00004`. The
+Five files, not two: the `CREATE TABLE` and `INSERT` made before the patch wrote
+`00000` through `00002`, and the `INSERT` above wrote `00003` and `00004`. The
 count depends on how many commits the table has taken; what the check is for is
-the single shared prefix and the timestamps straddling the patch.
+the single shared prefix and the timestamps straddling the patch. `mc` runs
+inside the MinIO pod, whose image has no `grep`, which is why the filter is on
+the host side of the pipe.
 
 ## 13. Add the second catalog
 
@@ -526,20 +654,22 @@ root keys the before state needed.
   kubectl rollout status deploy/polaris --timeout=600s
 ```
 
-Port-forward again, in the second terminal, then re-export the token:
+The pod was replaced, which killed the port-forward. Connect to Polaris again:
 
 ```bash
-  kubectl port-forward svc/polaris 8181:8181
-```
-
-```bash
-  export TOKEN=$(curl -s -X POST http://localhost:8181/api/catalog/v1/oauth/tokens \
+  lsof -t -i tcp:8181 -s tcp:LISTEN | xargs -r kill ; sleep 1 ; \
+  (kubectl port-forward svc/polaris 8181:8181 > /dev/null 2>&1 &) ; \
+  for i in $(seq 60); do curl -s -o /dev/null http://localhost:8181/api/catalog/v1/config && break; sleep 1; done ; \
+  TOKEN=$(curl -s -X POST http://localhost:8181/api/catalog/v1/oauth/tokens \
     -d "grant_type=client_credentials&client_id=root&client_secret=root&scope=PRINCIPAL_ROLE:ALL" \
-    | jq -r '.access_token')
+    | jq -r '.access_token // empty') ; export TOKEN ; \
+  if [ -n "$TOKEN" ]; then echo 'OK: Polaris is reachable and TOKEN is set'; else echo 'STOP: no TOKEN -- Polaris is not answering on localhost:8181'; fi
 ```
 
-`AWS_ACCESS_KEY_ID` is gone; both per-storage pairs are present; the chart's
-root pair remains (see [Notes](#notes)):
+`AWS_ACCESS_KEY_ID` is gone and both per-storage pairs are present. The chart's
+`polaris.storage.aws.access-key` / `.secret-key` pair remains: `values/polaris.yaml`
+points `storage.secret` at `minio-a-secrets`, and it is only the fallback for a
+catalog that names no `storageName`, which neither catalog does from here on:
 
 ```bash
   kubectl get deploy polaris -o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}{"\n"}{end}' \
@@ -564,26 +694,24 @@ root pair remains (see [Notes](#notes)):
     -d '{"catalogRole": {"name": "catalog_admin"}}'
 ```
 
-The same `$POLARIS_AUTH` check as in step 9, for the same reason — this Secret
-is rewritten, not merged, so a bad variable wipes the credential:
+Give Trino the second catalog's S3 keys. As before, `kubectl patch` changes only
+the keys it names and leaves `POLARIS_AUTH` untouched:
 
 ```bash
-  case "$POLARIS_AUTH" in ?*:?*) ;; *) echo 'POLARIS_AUTH is not a clientId:clientSecret pair -- do not run the next command';; esac
-```
-
-```bash
-  kubectl create secret generic trino-secrets \
-    --from-literal=POLARIS_AUTH="$POLARIS_AUTH" \
-    --from-literal=ACCESS_KEY_MINIO='cat-a-user' \
-    --from-literal=SECRET_KEY_MINIO='cat-a-secret-0123456789' \
-    --from-literal=ACCESS_KEY_MINIO_SD='cat-b-user' \
-    --from-literal=SECRET_KEY_MINIO_SD='cat-b-secret-0123456789' \
-    --dry-run=client -o yaml | kubectl apply -f -
+  kubectl patch secret trino-secrets --type merge \
+    -p '{"stringData": {"ACCESS_KEY_MINIO": "cat-a-user", "SECRET_KEY_MINIO": "cat-a-secret-0123456789", "ACCESS_KEY_MINIO_SD": "cat-b-user", "SECRET_KEY_MINIO_SD": "cat-b-secret-0123456789"}}'
 ```
 
 ```bash
   helm upgrade --install trino trino/trino --version 1.42.2 --values values/trino.yaml --timeout 10m
 ```
+
+The `helm upgrade` already replaces both Trino pods, because adding
+`lakehouse_fast` changes the pods' `checksum/catalog-config` annotation. The
+restart below therefore rolls them a second time, and on a first pass it is
+redundant. Keep it anyway: the chart has no checksum for `trino-secrets`, so on a
+re-run of this step, where the catalogs are unchanged and only the Secret
+differs, the restart is the only thing that loads the new credentials.
 
 ```bash
   kubectl rollout restart deploy/trino-coordinator deploy/trino-worker && \
@@ -615,13 +743,27 @@ ORDER BY total DESC;
 The join reads both MinIO instances at once — the same end state the
 from-scratch build produces, reached without rewriting a table.
 
-Each catalog's credentials are minted for its own MinIO user:
+Connect to Polaris, and log in as Trino with the pair from `trino-secrets`:
 
 ```bash
-  export TRINO_TOKEN=$(curl -s -X POST http://localhost:8181/api/catalog/v1/oauth/tokens \
-    -d "grant_type=client_credentials&client_id=${POLARIS_AUTH%%:*}&client_secret=${POLARIS_AUTH##*:}&scope=PRINCIPAL_ROLE:ALL" \
-    | jq -r '.access_token')
+  lsof -t -i tcp:8181 -s tcp:LISTEN | xargs -r kill ; sleep 1 ; \
+  (kubectl port-forward svc/polaris 8181:8181 > /dev/null 2>&1 &) ; \
+  for i in $(seq 60); do curl -s -o /dev/null http://localhost:8181/api/catalog/v1/config && break; sleep 1; done ; \
+  TOKEN=$(curl -s -X POST http://localhost:8181/api/catalog/v1/oauth/tokens \
+    -d "grant_type=client_credentials&client_id=root&client_secret=root&scope=PRINCIPAL_ROLE:ALL" \
+    | jq -r '.access_token // empty') ; export TOKEN ; \
+  if [ -n "$TOKEN" ]; then echo 'OK: Polaris is reachable and TOKEN is set'; else echo 'STOP: no TOKEN -- Polaris is not answering on localhost:8181'; fi
 ```
+
+```bash
+  POLARIS_AUTH=$(kubectl get secret trino-secrets -o jsonpath='{.data.POLARIS_AUTH}' | base64 -d) ; export POLARIS_AUTH ; \
+  TRINO_TOKEN=$(curl -s -X POST http://localhost:8181/api/catalog/v1/oauth/tokens \
+    -d "grant_type=client_credentials&client_id=${POLARIS_AUTH%%:*}&client_secret=${POLARIS_AUTH##*:}&scope=PRINCIPAL_ROLE:ALL" \
+    | jq -r '.access_token // empty') ; export TRINO_TOKEN ; \
+  if [ -n "$TRINO_TOKEN" ]; then echo 'OK: the trino-svc pair in trino-secrets authenticates'; else echo 'STOP: the POLARIS_AUTH pair in trino-secrets does not authenticate'; fi
+```
+
+Each catalog's credentials are minted for its own MinIO user:
 
 ```bash
   for t in lakehouse/namespaces/bronze/tables/customers lakehouse_fast/namespaces/bronze/tables/orders; do
@@ -633,16 +775,20 @@ Each catalog's credentials are minted for its own MinIO user:
   done
 ```
 
+Both catalogs match their definitions in `catalogs/`:
+
 ```bash
   for c in lakehouse lakehouse_fast; do
     printf '%s: ' "$c"
     curl -s "http://localhost:8181/api/management/v1/catalogs/$c" \
       -H "Authorization: Bearer $TOKEN" \
-      | jq -c --slurpfile target "catalogs/$c.json" \
-        '.storageConfigInfo as $live
-         | $target[0].catalog.storageConfigInfo
-         | to_entries | map(select(.value != $live[.key]))
-         | if length == 0 then "matches" else . end'
+      | jq -cn --slurpfile target "catalogs/$c.json" \
+        '(try input catch null) as $r
+         | if $r.storageConfigInfo == null then "request failed: \($r.error.message // "empty response -- check $TOKEN and the port-forward")"
+           else $r.storageConfigInfo as $live
+             | $target[0].catalog.storageConfigInfo
+             | to_entries | map(select(.value != $live[.key]))
+             | if length == 0 then "matches" else . end end'
   done
 ```
 
@@ -715,7 +861,7 @@ step that this file never takes, so treat it as unverified for your deployment.
 | step | what goes away | for how long |
 |---|---|---|
 | each `helm upgrade` of Polaris (steps 5, 10, 13) | the catalog | ~2–4 s |
-| each `helm upgrade` of MinIO (step 9) | that MinIO instance | **not measured** |
+| each `helm upgrade` of MinIO (step 9) | that MinIO instance | ~2 s each: 1.6–2.2 s (`minio-a`), 1.6–1.8 s (`minio-b`) over three runs, sometimes as two short gaps — see below |
 | the catalog `PUT` (step 11) | nothing | — |
 | the metastore restore | the catalog | ~13 s |
 
@@ -724,11 +870,22 @@ but there is still an endpoint-propagation gap at cutover. The ~13 s restore
 figure is from a near-empty metastore and tells you nothing about a real one —
 measure it against a production-sized copy.
 
-The MinIO row is the gap in this table. Step 9 was verified to replace both the
-`minio-a` and `minio-b` pods, but no prober was pointed at `svc/minio-a` while
-it happened, so the window is unquantified. Measure it before you schedule that
-step: unlike the Polaris rows, it takes **object storage** down, which stops
-readers and writers that never touch the catalog.
+The MinIO row is the weakest figure in this table. It comes from an in-cluster
+prober that polled `/minio/health/live` on `svc/minio-a` and `svc/minio-b` about
+every 0.28 s while both step 9 upgrades ran, on three separate end-to-end runs.
+Each instance missed one to three probes, and the window runs from the last
+successful probe before the cutover to the first one after it. The cutover is
+not always one clean gap. On one run `minio-a` failed, answered, then failed
+again 1.8 s later, so the Service flapped between the old and new pods. Count a
+flap from its first failure, about 2.2 s in that case. The spread between runs
+(1.6 s, 2.2 s, 2.2 s for `minio-a`) is a reminder that three samples bound
+nothing; plan for more. Three things it does not tell you. The
+buckets were near-empty. A liveness answer is not a served `GET` or `PUT`, so
+the gap for real S3 traffic may be longer. And the effect on a multipart upload
+that is in flight across the cutover was not tested. Measure it with real
+traffic before you schedule that step: unlike the Polaris rows, it takes
+**object storage** down, which stops readers and writers that never touch the
+catalog.
 
 **The restore's data loss is real and silent.** Restoring a dump taken before
 step 11 onto the finished cluster reverted `customers` from five rows to three
@@ -785,9 +942,10 @@ pipe, as step 12 does.
 | `Cannot modify AWS account ID in storage config` | `roleArn` differs from the stored one |
 | `400` with an **empty body**, and no `ExceptionMapper` line in the log | `storageType` was left out of the replacement document. Without it Jackson cannot resolve which `storageConfigInfo` subtype to build, so the request is rejected while it is still being deserialised — before any Polaris validation runs. There is no mapped exception to grep for; the access log shows `"PUT /api/management/v1/catalogs/lakehouse HTTP/1.1" 400 -` |
 | `Unsupported storage type: ...` | `storageType` was changed. `values/polaris.yaml` narrows `SUPPORTED_CATALOG_STORAGE_TYPES` to `S3`, so any other value is rejected |
-| every call answers `401` | `$TOKEN` or `$TRINO_TOKEN` expired — re-run its `export` |
-| Trino says `Not authorized:` with an empty message, and Polaris logs `401` on `GET /api/catalog/v1/config` | `POLARIS_AUTH` in `trino-secrets` is empty or `":"` — see [If you lose the POLARIS_AUTH pair](#if-you-lose-the-polaris_auth-pair) |
-| `curl: (7) Failed to connect` or `curl: (52) Empty reply` on port 8181 | a `helm upgrade` of Polaris replaced the pod and killed the port-forward — `(52)` if the old forward has not exited yet |
+| `STOP: no TOKEN`, or a call answers `401` | the token expired (they last an hour) or the port-forward died. Re-run the *Connect to Polaris* block at the top of the step you are in; it restarts the port-forward and issues a new `$TOKEN` |
+| Trino says `Not authorized:` with an empty message, Polaris logs `401` on `GET /api/catalog/v1/config`, or a block prints `STOP: the POLARIS_AUTH pair in trino-secrets does not authenticate` | `POLARIS_AUTH` in `trino-secrets` is empty or not a working pair. The steps never rewrite it after the principal is created, so this comes from a Secret written by an older version of this file. Rebuild the principal with the blocks in [If you lose the POLARIS_AUTH pair](#if-you-lose-the-polaris_auth-pair) |
+| `curl: (7) Failed to connect` or `curl: (52) Empty reply` on port 8181 | a `helm upgrade` of Polaris replaced the pod and killed the port-forward — `(52)` if the old forward has not exited yet. Re-run the *Connect to Polaris* block of the step you are in |
+| `bind: address already in use` from `kubectl port-forward`, and the *Connect to Polaris* block prints `STOP: no TOKEN` | a process the block cannot stop — one owned by another user — is holding 8181. The block stops whatever *you* have listening on 8181 before it starts the forward. `sudo lsof -i :8181` names the process; stop it and re-run the block |
 | `AccessDenied` on metadata writes after the patch | the MinIO user's policy does not cover the bucket, or `storageName` points at the wrong pair |
 | Trino still authenticating as the old user | `trino-secrets` changed but the pods did not restart |
 | `pods "polaris-bootstrap" already exists` | `kubectl delete pod polaris-bootstrap`, then run it again |
@@ -796,6 +954,7 @@ pipe, as step 12 does.
 | `error reading secrets/postgres-secrets.env: no such file or directory`, or any `no such file or directory` on `values/`, `catalogs/`, `manifests/` or `overlays/` | the shell is not in the directory holding this README. `cd` there and re-run the step; nothing was created, so there is nothing to clean up |
 | `stsEndpoint` unreachable | it must resolve **from Polaris**, i.e. the in-cluster service name |
 | `Failed to load table` right after a rollback | the rollback was done after step 13 — see [Rolling back](#rolling-back) |
+| `lakehouse` works but `lakehouse_fast` answers `Failed to load table`, and Polaris logs `Storage name 'storageb' is not configured on the server` | Polaris was redeployed with `polaris-storagea-only.yaml` after step 13. Redeploy with `polaris-recovery.yaml` (to stay rolled back) or `values/polaris.yaml` alone (to return to the end state) |
 | `View does not exist: bronze.customers` in the Polaris log | not an error: Trino checks whether a name is a view before treating it as a table |
 
 Polaris reports most of these as mapped exceptions — the exception is the
@@ -833,31 +992,45 @@ The dump contains `principal_authentication_data` — every principal's
 credentials. `backup/` is in this repo's `.gitignore`; keep it that way, and
 treat the file as a secret wherever you put it.
 
+Each backup goes into its own timestamped directory, named by `$BACKUP`. The
+directory is created with a plain `mkdir`, which refuses a name that already
+exists, so a backup can never overwrite an earlier one. That matters most at
+the worst moment: if step 11 goes wrong and you take a backup again before
+restoring, a fixed file name would replace the last good dump with the broken
+state, and nothing would warn you.
+
+Connect to Polaris:
+
 ```bash
-  mkdir -p backup && kubectl exec deploy/postgres-polaris -- \
+  lsof -t -i tcp:8181 -s tcp:LISTEN | xargs -r kill ; sleep 1 ; \
+  (kubectl port-forward svc/polaris 8181:8181 > /dev/null 2>&1 &) ; \
+  for i in $(seq 60); do curl -s -o /dev/null http://localhost:8181/api/catalog/v1/config && break; sleep 1; done ; \
+  TOKEN=$(curl -s -X POST http://localhost:8181/api/catalog/v1/oauth/tokens \
+    -d "grant_type=client_credentials&client_id=root&client_secret=root&scope=PRINCIPAL_ROLE:ALL" \
+    | jq -r '.access_token // empty') ; export TOKEN ; \
+  if [ -n "$TOKEN" ]; then echo 'OK: Polaris is reachable and TOKEN is set'; else echo 'STOP: no TOKEN -- Polaris is not answering on localhost:8181'; fi
+```
+
+The block checks that the dump holds Polaris's tables — a dump that ran against
+the wrong database succeeds and produces a file with no data in it — and that
+both JSON records came back from the API:
+
+```bash
+  BACKUP=backup/$(date +%Y%m%dT%H%M%S) ; export BACKUP ; \
+  mkdir -p backup && mkdir "$BACKUP" && \
+  kubectl exec deploy/postgres-polaris -- \
     pg_dump -U postgres -d polaris --format=plain --clean --if-exists \
-    > backup/polaris-metastore.sql
+    > "$BACKUP/polaris-metastore.sql" && \
+  [ "$(grep -c 'COPY polaris_schema' "$BACKUP/polaris-metastore.sql")" -gt 0 ] && \
+  curl -sf http://localhost:8181/api/management/v1/catalogs \
+    -H "Authorization: Bearer $TOKEN" > "$BACKUP/catalogs.json" && \
+  curl -sf http://localhost:8181/api/management/v1/principal-roles \
+    -H "Authorization: Bearer $TOKEN" > "$BACKUP/principal-roles.json" && \
+  echo "OK: backup complete in $BACKUP" || echo "STOP: the backup in $BACKUP is incomplete"
 ```
 
 ```bash
-  grep -c 'COPY polaris_schema' backup/polaris-metastore.sql
-```
-
-That must print a non-zero count — a dump that ran against the wrong database
-succeeds and produces a file with no data in it.
-
-```bash
-  curl -s http://localhost:8181/api/management/v1/catalogs \
-    -H "Authorization: Bearer $TOKEN" > backup/catalogs.json
-```
-
-```bash
-  curl -s http://localhost:8181/api/management/v1/principal-roles \
-    -H "Authorization: Bearer $TOKEN" > backup/principal-roles.json
-```
-
-```bash
-  jq -r '.catalogs[] | "\(.name) entityVersion=\(.entityVersion) storageName=\(.storageConfigInfo.storageName)"' backup/catalogs.json
+  jq -r '.catalogs[] | "\(.name) entityVersion=\(.entityVersion) storageName=\(.storageConfigInfo.storageName)"' "$BACKUP/catalogs.json"
 ```
 
 ### Which recovery you need
@@ -866,9 +1039,19 @@ succeeds and produces a file with no data in it.
 |---|---|
 | the catalog was patched with the wrong `storageConfigInfo`, nothing else touched, and you are still before step 13 | the `PUT` in [Rolling back](#rolling-back). Seconds, no restart, no data loss |
 | the wrong catalog was patched, several were touched, or a principal, role or grant was damaged | the metastore restore below. The rollback `PUT` cannot help: the storage config is not what is broken |
-| you are past step 13 | restore Polaris's `AWS_*` pair first — redeploy with `overlays/polaris-storagea-only.yaml` — then either remedy |
+| you are past step 13 | restore Polaris's `AWS_*` pair first — redeploy with `overlays/polaris-recovery.yaml`, as in [Rolling back](#rolling-back) — then either remedy. **Not** `polaris-storagea-only.yaml`: it has no `storageb` pair, so it breaks `lakehouse_fast` |
 
 ### Restoring the metastore
+
+Point `$BACKUP` at the dump you mean to restore, and check it before you stop
+anything. In the shell that took the backup it is already set. In any other
+shell, `ls backup/` lists every dump by time; choose the last one taken *before*
+the change that went wrong, which is not necessarily the newest.
+
+```bash
+  [ -s "$BACKUP/polaris-metastore.sql" ] && ls -l "$BACKUP" \
+    || echo 'BACKUP does not name a dump -- export BACKUP=backup/<timestamp> first; do not run the next command'
+```
 
 Stop Polaris first, so nothing writes while the dump is loading. This is a
 catalog outage for its duration; Trino queries already running against cached
@@ -881,7 +1064,7 @@ metadata may survive, new table loads will not.
 
 ```bash
   kubectl exec -i deploy/postgres-polaris -- \
-    psql -U postgres -d polaris -v ON_ERROR_STOP=1 -q < backup/polaris-metastore.sql
+    psql -U postgres -d polaris -v ON_ERROR_STOP=1 -q < "$BACKUP/polaris-metastore.sql"
 ```
 
 ```bash
@@ -889,9 +1072,19 @@ metadata may survive, new table loads will not.
   kubectl rollout status deploy/polaris --timeout=600s
 ```
 
-The pod is new, so restart the port-forward in the second terminal and
-re-export `$TOKEN`, exactly as in steps 10 and 13. Then confirm the restore —
-the `diff` printing nothing is the check:
+The pod is new, which killed the port-forward. Connect to Polaris again:
+
+```bash
+  lsof -t -i tcp:8181 -s tcp:LISTEN | xargs -r kill ; sleep 1 ; \
+  (kubectl port-forward svc/polaris 8181:8181 > /dev/null 2>&1 &) ; \
+  for i in $(seq 60); do curl -s -o /dev/null http://localhost:8181/api/catalog/v1/config && break; sleep 1; done ; \
+  TOKEN=$(curl -s -X POST http://localhost:8181/api/catalog/v1/oauth/tokens \
+    -d "grant_type=client_credentials&client_id=root&client_secret=root&scope=PRINCIPAL_ROLE:ALL" \
+    | jq -r '.access_token // empty') ; export TOKEN ; \
+  if [ -n "$TOKEN" ]; then echo 'OK: Polaris is reachable and TOKEN is set'; else echo 'STOP: no TOKEN -- Polaris is not answering on localhost:8181'; fi
+```
+
+Then confirm the restore — the `diff` printing nothing is the check:
 
 ```bash
   curl -s http://localhost:8181/api/management/v1/principal-roles \
@@ -900,8 +1093,14 @@ the `diff` printing nothing is the check:
 
 ```bash
   curl -s http://localhost:8181/api/management/v1/catalogs -H "Authorization: Bearer $TOKEN" \
-    | jq -S '.' | diff <(jq -S '.' backup/catalogs.json) - && echo "matches the backup"
+    | jq -S '.catalogs |= sort_by(.name)' \
+    | diff <(jq -S '.catalogs |= sort_by(.name)' "$BACKUP/catalogs.json") - && echo "matches the backup"
 ```
+
+Both sides are sorted by catalog name because Polaris does not list catalogs in
+a fixed order. `jq -S` sorts the keys inside each object, not the entries of an
+array. Without the `sort_by`, a restore that brought back exactly the right
+catalogs can still print a long diff: the same two entries, swapped.
 
 ```bash
   kubectl exec -i deploy/trino-coordinator -- trino --server localhost:8080 --user admin \
@@ -928,30 +1127,51 @@ hash. The pair in `trino-secrets` is the only copy: it is not in the metastore,
 not in the API and not in the logs. Two things that look like recoveries are
 not, and both were tried against a running cluster:
 
-* **Re-running step 6's export.** That call *creates* the principal. Against an
-  existing one it answers `409 AlreadyExistsException`, and the `jq` at the end
-  of the pipeline turns that error body into the string `":"` — not empty, not a
-  credential, and accepted by any check that only tests for emptiness.
+* **Creating the principal again.** Against an existing `trino-svc` it answers
+  `409 AlreadyExistsException` and returns no credentials.
 * **Rotating the credentials.** `POST /principals/{name}/rotate` exists, but the
   service admin may not call it for somebody else. As `root` it answers
   `403 Principal 'root' ... is not authorized for op ROTATE_CREDENTIALS`. Only
   the principal itself may rotate, using the secret you no longer have.
 
-If you have a dump, [restore the metastore](#restoring-the-metastore) — it
-brings the original pair back and every client keeps working. Otherwise the
-principal has to be rebuilt, and that issues a **new `clientId`**, so every
-client holding the old pair has to be updated.
+If you have a dump taken on this cluster, restoring the metastore brings the
+original pair back and every client keeps working. Otherwise the principal has
+to be rebuilt, and that issues a **new `clientId`**, so every client holding the
+old pair has to be updated. The blocks below rebuild it and put the new pair
+into `trino-secrets`; they work at any point after the principal was first
+created.
+
+Connect to Polaris:
+
+```bash
+  lsof -t -i tcp:8181 -s tcp:LISTEN | xargs -r kill ; sleep 1 ; \
+  (kubectl port-forward svc/polaris 8181:8181 > /dev/null 2>&1 &) ; \
+  for i in $(seq 60); do curl -s -o /dev/null http://localhost:8181/api/catalog/v1/config && break; sleep 1; done ; \
+  TOKEN=$(curl -s -X POST http://localhost:8181/api/catalog/v1/oauth/tokens \
+    -d "grant_type=client_credentials&client_id=root&client_secret=root&scope=PRINCIPAL_ROLE:ALL" \
+    | jq -r '.access_token // empty') ; export TOKEN ; \
+  if [ -n "$TOKEN" ]; then echo 'OK: Polaris is reachable and TOKEN is set'; else echo 'STOP: no TOKEN -- Polaris is not answering on localhost:8181'; fi
+```
 
 ```bash
   curl -X DELETE http://localhost:8181/api/management/v1/principals/trino-svc \
     -H "Authorization: Bearer $TOKEN"
 ```
 
+Create the principal again and store the new pair in the same block.
+`kubectl patch` replaces only `POLARIS_AUTH`; the S3 keys already in the Secret
+stay as they are. Nothing is written unless Polaris returned credentials:
+
 ```bash
-  export POLARIS_AUTH=$(curl -s -X POST http://localhost:8181/api/management/v1/principals \
+  POLARIS_AUTH=$(curl -s -X POST http://localhost:8181/api/management/v1/principals \
     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
     -d '{"principal": {"name": "trino-svc", "type": "SERVICE"}}' \
-    | jq -r '.credentials.clientId + ":" + .credentials.clientSecret')
+    | jq -r 'if .credentials.clientId and .credentials.clientSecret then .credentials.clientId + ":" + .credentials.clientSecret else empty end') ; \
+  export POLARIS_AUTH ; \
+  if [ -n "$POLARIS_AUTH" ]; then \
+    kubectl patch secret trino-secrets --type merge -p "{\"stringData\": {\"POLARIS_AUTH\": \"$POLARIS_AUTH\"}}" \
+    && echo 'OK: trino-svc re-created and its new pair stored in trino-secrets' ; \
+  else echo 'STOP: Polaris returned no credentials for trino-svc -- nothing was written'; fi
 ```
 
 Deleting a principal takes its principal-role assignments with it, so the
@@ -970,8 +1190,28 @@ not reassigned:
     -H "Authorization: Bearer $TOKEN" | jq -c '[.roles[].name]'
 ```
 
-That must print `["data_engineer"]`. Then rewrite `trino-secrets` exactly as
-step 9 (before step 13) or step 13 (after it) does, and restart Trino.
+That must print `["data_engineer"]`. The pair in the Secret must log in:
+
+```bash
+  POLARIS_AUTH=$(kubectl get secret trino-secrets -o jsonpath='{.data.POLARIS_AUTH}' | base64 -d) ; export POLARIS_AUTH ; \
+  TRINO_TOKEN=$(curl -s -X POST http://localhost:8181/api/catalog/v1/oauth/tokens \
+    -d "grant_type=client_credentials&client_id=${POLARIS_AUTH%%:*}&client_secret=${POLARIS_AUTH##*:}&scope=PRINCIPAL_ROLE:ALL" \
+    | jq -r '.access_token // empty') ; export TRINO_TOKEN ; \
+  if [ -n "$TRINO_TOKEN" ]; then echo 'OK: the trino-svc pair in trino-secrets authenticates'; else echo 'STOP: the POLARIS_AUTH pair in trino-secrets does not authenticate'; fi
+```
+
+Trino reads the Secret only at start-up:
+
+```bash
+  kubectl rollout restart deploy/trino-coordinator deploy/trino-worker && \
+  kubectl rollout status deploy/trino-coordinator --timeout=600s && \
+  kubectl rollout status deploy/trino-worker --timeout=600s
+```
+
+```bash
+  kubectl exec -i deploy/trino-coordinator -- trino --server localhost:8080 --user admin \
+    --execute "SELECT count(*) FROM lakehouse.bronze.customers"
+```
 
 ## Rolling back
 
@@ -981,26 +1221,64 @@ A rolled-back catalog goes back to `"stsUnavailable": true`, which sends Polaris
 to the default credentials provider chain; step 13 emptied that chain. Roll back
 after step 13 and every query fails with `Failed to load table`, and Polaris logs
 `SdkClientException: Unable to load credentials from any of the providers in the
-chain`. To undo the migration at that point, redeploy Polaris with
-`overlays/polaris-storagea-only.yaml` first, then send the `PUT` below.
+chain`.
+
+**After step 13, redeploy Polaris with `overlays/polaris-recovery.yaml` first**,
+then send the `PUT` below. Before step 13, skip straight to the `PUT`: the
+`AWS_*` pair is still there.
+
+Do not use `overlays/polaris-storagea-only.yaml` for this, even though it also
+carries the `AWS_*` pair. Helm replaces `extraEnv` wholesale, and that overlay
+has no `storageb` entry. Redeploying with it after step 13 fixes `lakehouse` and
+breaks `lakehouse_fast`: `SELECT` on it fails with `Failed to load table`, and
+Polaris logs `Storage name 'storageb' is not configured on the server`.
+`polaris-recovery.yaml` is exactly the step 13 environment plus the `AWS_*`
+pair. With it, and with `lakehouse` rolled back, both catalogs were verified to
+read, write and join.
 
 ```bash
-  export VERSION=$(curl -s http://localhost:8181/api/management/v1/catalogs/lakehouse \
-    -H "Authorization: Bearer $TOKEN" | jq -r '.entityVersion')
+  helm upgrade --install polaris polaris/polaris --version 1.5.0 \
+    --values values/polaris.yaml \
+    --values overlays/polaris-recovery.yaml \
+    --timeout 10m
 ```
 
 ```bash
-  curl -X PUT http://localhost:8181/api/management/v1/catalogs/lakehouse \
-    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-    -d "$(jq -n --argjson version "$VERSION" \
-          --slurpfile before catalogs/lakehouse-before.json \
-          '{currentEntityVersion: $version, storageConfigInfo: $before[0].catalog.storageConfigInfo}')"
+  kubectl rollout status deploy/polaris --timeout=600s
+```
+
+Connect to Polaris. Run this whether or not you redeployed — a redeploy
+replaces the pod and kills the port-forward:
+
+```bash
+  lsof -t -i tcp:8181 -s tcp:LISTEN | xargs -r kill ; sleep 1 ; \
+  (kubectl port-forward svc/polaris 8181:8181 > /dev/null 2>&1 &) ; \
+  for i in $(seq 60); do curl -s -o /dev/null http://localhost:8181/api/catalog/v1/config && break; sleep 1; done ; \
+  TOKEN=$(curl -s -X POST http://localhost:8181/api/catalog/v1/oauth/tokens \
+    -d "grant_type=client_credentials&client_id=root&client_secret=root&scope=PRINCIPAL_ROLE:ALL" \
+    | jq -r '.access_token // empty') ; export TOKEN ; \
+  if [ -n "$TOKEN" ]; then echo 'OK: Polaris is reachable and TOKEN is set'; else echo 'STOP: no TOKEN -- Polaris is not answering on localhost:8181'; fi
+```
+
+Read `currentEntityVersion` and send the `PUT` in one block. Nothing is sent if
+the version could not be read. It must end with `HTTP 200`:
+
+```bash
+  VERSION=$(curl -sf http://localhost:8181/api/management/v1/catalogs/lakehouse \
+    -H "Authorization: Bearer $TOKEN" | jq -r '.entityVersion // empty') ; export VERSION ; \
+  if [ -n "$VERSION" ]; then \
+    curl -s -w '\nHTTP %{http_code}\n' -X PUT http://localhost:8181/api/management/v1/catalogs/lakehouse \
+      -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+      -d "$(jq -n --argjson version "$VERSION" \
+            --slurpfile before catalogs/lakehouse-before.json \
+            '{currentEntityVersion: $version, storageConfigInfo: $before[0].catalog.storageConfigInfo}')" ; \
+  else echo 'STOP: the entityVersion of lakehouse could not be read -- nothing was sent'; fi
 ```
 
 ## Teardown
 
 ```bash
-  minikube stop && minikube delete
+  lsof -t -i tcp:8181 -s tcp:LISTEN | xargs -r kill ; minikube stop && minikube delete
 ```
 
 ## Files
@@ -1022,6 +1300,7 @@ identical to the companion project's.
   overlays/minio-no-scoped-user.yaml     BEFORE: minio-a/minio-b without their user and bucket policy
   overlays/polaris-before.yaml           BEFORE: Polaris without per-storage credential resolution
   overlays/polaris-storagea-only.yaml    MID:    Polaris knowing storagea but not yet storageb
+  overlays/polaris-recovery.yaml         RECOVERY: the end state plus the AWS_* pair, for a rollback after step 13
   values/trino-before.yaml               BEFORE: Trino with one catalog and minio-a's root keys
   catalogs/lakehouse-before.json         BEFORE: the catalog with "stsUnavailable": true
   catalogs/lakehouse-storage-after.json  the replacement storageConfigInfo the patch sends

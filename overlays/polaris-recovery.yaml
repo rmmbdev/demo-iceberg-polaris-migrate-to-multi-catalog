@@ -1,0 +1,38 @@
+# Overlay for values/polaris.yaml -- recovery AFTER step 13 of the README.
+#
+# Rolling a catalog back to "stsUnavailable": true sends Polaris to the AWS
+# default credentials provider chain, which step 13 emptied. This overlay puts
+# the ambient AWS_* pair back so a rolled-back catalog can reach MinIO again.
+#
+# It is not overlays/polaris-storagea-only.yaml, and must not be. Helm replaces
+# lists wholesale, so that overlay's extraEnv drops the storageb pair values/polaris.yaml
+# adds -- and by step 13 lakehouse_fast names storageb. Redeploying with it
+# fixes the rolled-back catalog and breaks the other one:
+#
+#   IllegalArgumentException: Storage name 'storageb' is not configured on the server
+#
+# So this overlay restates all three: the AWS_* pair, storagea and storageb.
+features:
+  RESOLVE_CREDENTIALS_BY_STORAGE_NAME: true
+
+extraEnv:
+  - name: AWS_REGION
+    value: "us-east-1"
+  - name: AWS_ACCESS_KEY_ID
+    valueFrom:
+      secretKeyRef: { name: minio-a-secrets, key: rootUser }
+  - name: AWS_SECRET_ACCESS_KEY
+    valueFrom:
+      secretKeyRef: { name: minio-a-secrets, key: rootPassword }
+  - name: polaris.storage.aws.storagea.access-key
+    valueFrom:
+      secretKeyRef: { name: catalog-users-secrets, key: catAUser }
+  - name: polaris.storage.aws.storagea.secret-key
+    valueFrom:
+      secretKeyRef: { name: catalog-users-secrets, key: catAPassword }
+  - name: polaris.storage.aws.storageb.access-key
+    valueFrom:
+      secretKeyRef: { name: catalog-users-secrets, key: catBUser }
+  - name: polaris.storage.aws.storageb.secret-key
+    valueFrom:
+      secretKeyRef: { name: catalog-users-secrets, key: catBPassword }
